@@ -1,4 +1,5 @@
 import dbus
+import subprocess
 from PyQt6.QtCore import QObject, pyqtSignal
 
 class CallManager(QObject):
@@ -15,6 +16,7 @@ class CallManager(QObject):
         self.modem_path = None
         self.vcm_interface = None
         self.active_calls = {}
+        self.echo_cancel_module_id = None
         
     def find_modem(self):
         try:
@@ -59,6 +61,7 @@ class CallManager(QObject):
             # hide_id = "default"
             path = self.vcm_interface.Dial(number, "default")
             self.outgoing_call.emit(path, number)
+            self.enable_echo_cancel()
             return True
         except Exception as e:
             print(f"Error dialing: {e}")
@@ -66,6 +69,9 @@ class CallManager(QObject):
 
     def answer_call(self, path):
         try:
+            # Enable AEC BEFORE answering so the SCO audio stream opens on
+            # the AEC-cleaned virtual mic, not the raw hardware mic.
+            self.enable_echo_cancel()
             call = dbus.Interface(self.bus.get_object(self.ofono_service, path), 'org.ofono.VoiceCall')
             call.Answer()
             self.call_answered.emit(path)
@@ -101,10 +107,77 @@ class CallManager(QObject):
             self.incoming_call.emit(path, caller)
         elif state == "active":
             self.call_answered.emit(path)
+            self.enable_echo_cancel()
         elif state in ["dialing", "alerting"]:
             self.outgoing_call.emit(path, caller)
+            self.enable_echo_cancel()
 
     def _on_call_removed(self, path):
         if path in self.active_calls:
             del self.active_calls[path]
         self.call_ended.emit(path)
+        
+        # Disable echo cancel if no more active calls
+        if not self.active_calls:
+            self.disable_echo_cancel()
+
+    def enable_echo_cancel(self):
+        """
+        Load WebRTC AEC + noise suppression, then set ec_mic as default source
+        BEFORE the SCO stream opens, so oFono grabs the clean virtual mic.
+        Only touch the source (mic) — do NOT change default sink so oFono
+        audio playback path remains intact.
+        """
+        if self.echo_cancel_module_id is not None:
+            return  # already active
+
+        # Save current default source to restore later
+        try:
+            self._orig_source = subprocess.check_output(
+                ['pactl', 'get-default-source'], text=True).strip()
+        except Exception:
+            self._orig_source = None
+
+        # Load AEC module — simple args, no complex escaping
+        try:
+            output = subprocess.check_output([
+                'pactl', 'load-module', 'module-echo-cancel',
+                'aec_method=webrtc',
+                'source_name=btcaller_ec_mic',
+                'sink_name=btcaller_ec_spk',
+                'aec_args=noise_suppression=1 voice_detection=1',
+            ], text=True)
+            self.echo_cancel_module_id = output.strip()
+            print(f"[Audio] AEC module loaded id={self.echo_cancel_module_id}")
+        except Exception as e:
+            print(f"[Audio] Failed to load AEC module: {e}")
+            return
+
+        # Switch default source to AEC-cleaned mic
+        try:
+            subprocess.run(['pactl', 'set-default-source', 'btcaller_ec_mic'], check=True)
+            print("[Audio] Default source → btcaller_ec_mic (AEC + noise gate)")
+        except Exception as e:
+            print(f"[Audio] Failed to switch source: {e}")
+
+    def disable_echo_cancel(self):
+        """Restore original source then unload AEC module."""
+        if self.echo_cancel_module_id is None:
+            return
+
+        # Restore original source first so PipeWire doesn't fall back to monitor
+        if getattr(self, '_orig_source', None):
+            try:
+                subprocess.run(['pactl', 'set-default-source', self._orig_source])
+                print(f"[Audio] Restored default source → {self._orig_source}")
+            except Exception as e:
+                print(f"[Audio] Failed to restore source: {e}")
+
+        try:
+            subprocess.run(['pactl', 'unload-module', self.echo_cancel_module_id])
+            print(f"[Audio] AEC module unloaded id={self.echo_cancel_module_id}")
+        except Exception as e:
+            print(f"[Audio] Failed to unload AEC module: {e}")
+        finally:
+            self.echo_cancel_module_id = None
+            self._orig_source = None
